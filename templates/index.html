@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>KTP OCR Interface</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h2>KTP OCR Demo (FastAPI)</h2>
+
+    <form id="uploadForm">
+        <input type="file" id="fileInput" accept="image/*" required>
+        <button type="submit">Upload & Process</button>
+    </form>
+
+    <div id="preview"></div>
+    <pre id="output"></pre>
+
+<script>
+document.getElementById("uploadForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const file = document.getElementById("fileInput").files[0];
+    if (!file) return alert("Select an image first.");
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    document.getElementById("output").textContent = "Processing...";
+
+    let res = await fetch("/ocr", {
+        method: "POST",
+        body: formData
+    });
+
+    let json = await res.json();
+
+    // show processed image
+    if (json.image_url) {
+        document.getElementById("preview").innerHTML = 
+            `<img src="${json.image_url}" style="max-width:300px; margin-top:10px;">`;
+    }
+
+    document.getElementById("output").textContent =
+        JSON.stringify(json, null, 2);
+});
+</script>
+
+</body>
+</html>
