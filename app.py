@@ -176,37 +176,40 @@ async def save_uploaded_file(file: UploadFile) -> Path:
     return file_path
 
 async def process_ocr_file(file_path: Path, original_filename: str) -> dict:
-    """Process file with OCR and return result"""
+    """
+    Process file with OCR and return result.
+    UPDATED: now supports new worker output format (raw_text as full lines).
+    """
+
+    # Run enhanced KTP processing
     text_lines, extracted_data, output_json = await asyncio.to_thread(
         enhanced_ktp_processing,
         str(file_path)
     )
-    
-    # Parse response
-    if isinstance(output_json, str):
+
+    # Worker now returns output_json as str → convert to dict
+    try:
         result = json.loads(output_json)
-    elif isinstance(output_json, dict):
-        result = output_json
-    else:
+    except Exception:
+        # fallback if something unexpected happens
         result = {
             "raw_text": text_lines,
             "extracted_data": extracted_data,
             "confidence_info": {"mean_confidence": 0}
         }
-    
-    # Add metadata
-    result.update({
-        "metadata": {
-            "filename": original_filename,
-            "processed_id": file_path.name.split('_')[0],
-            "file_size": file_path.stat().st_size,
-            "timestamp": time.time(),
-            "image_url": f"/uploads/{file_path.name}"
-        },
-        "success": True
-    })
-    
+
+    # Add additional metadata
+    result["metadata"] = {
+        "filename": original_filename,
+        "processed_id": file_path.name.split("_")[0],
+        "file_size": file_path.stat().st_size,
+        "timestamp": time.time(),
+        "image_url": f"/uploads/{file_path.name}"
+    }
+
+    result["success"] = True
     return result
+
 
 # ========== ROUTES ==========
 @app.get("/", response_class=HTMLResponse)

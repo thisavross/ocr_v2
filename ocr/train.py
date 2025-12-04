@@ -94,6 +94,7 @@ EXPECTED_FIELDS_UPPER = [
     "JENIS KELAMIN","GOL DARAH", "ALAMAT", "RT/RW", "KEL/DESA", "KECAMATAN",
     "AGAMA", "STATUS PERKAWINAN", "PEKERJAAN", "KEWARGANEGARAAN", "BERLAKU HINGGA"
 ]
+EXPECTED_FIELDS_SET = set(EXPECTED_FIELDS_UPPER)
 
 CONTROLLED_VALUES = {
     "JENIS KELAMIN" : ["LAKILAKI", "PEREMPUAN"],
@@ -108,6 +109,11 @@ CONTROLLED_VALUES_UPPER = {
     for key, values in CONTROLLED_VALUES.items()
 }
 
+CONTROLLED_LOOKUP = {}
+for field, values in CONTROLLED_VALUES.items():
+    for v in values:
+        CONTROLLED_LOOKUP[v.upper()] = (field, v)
+        
 # Create a set for O(1) lookups of perfect field matches
 EXPECTED_FIELDS_SET = set(EXPECTED_FIELDS_UPPER)
 # OPTIMIZED FUZZY MATCHING WITH PERFECT MATCH SKIPPING 
@@ -157,7 +163,7 @@ def quick_ocr_correction(value_upper, field):
         # Common OCR errors for religion
         corrections = {
             "ISLAM": ["ISLAM", "ISIAM", "ISLAM", "ISLAM"],
-            "KRISTEN": ["KRISTEN", "KRISTEN", "KRISTEN"],
+            "KRISTEN": ["KRISTEN", "KRISTEN", "KRISTEN", "KAISTEN"],
             "KATOLIK": ["KATOLIK", "KATOLIK", "KATOLLK"],
             "HINDU": ["HINDU", "HINDU", "HINDU"],
             "BUDDHA": ["BUDDHA", "BUDHA", "BUDDHA"],
@@ -180,6 +186,54 @@ def quick_ocr_correction(value_upper, field):
                 return correct
     
     return None
+
+def fuzzy_match_field(text, threshold=75):
+    """
+    Match ONLY real KTP field names.
+    NEVER match values 
+    """
+    if not text or not text.strip():
+        return None
+
+    clean = re.sub(r'[^A-Z0-9/ ]', '', text.upper()).strip()
+
+    # Fast exact match
+    if clean in EXPECTED_FIELDS_SET:
+        return clean
+
+    # Only match if clean TOKEN (one word)
+    # Values like "KAISTEN", "TANJUNG MORAWA" won't match anymore
+    if " " in clean:
+        return None
+
+    # Common variations
+    field_variations = {
+        "PROVINSI": ["PROVINSI", "PROV", "PROVINS"],
+        "KABUPATEN": ["KABUPATEN", "KAB", "KABUPATEN"],
+        "TEMPAT/TGL LAHIR": ["TEMPAT TGL LAHIR", "TEMPAT/TGLLAHIR"],
+        "JENIS KELAMIN": ["JENIS KELAMIN", "JENISKELAMIN"],
+        "GOL DARAH": ["GOL. DARAH", "GOLDARAH"],
+        "RT/RW": ["RT RW", "AT/RW", "RTRW", "AT RW", "AT/RW", "ATAW"],  
+        "KEL/DESA": ["KEL DESA", "KELDESA"],
+        "STATUS PERKAWINAN": ["STATUSPERKAWINAN"],
+        "BERLAKU HINGGA": ["BERLAKUHINGGA"]
+    }
+    for field, var_list in field_variations.items():
+        if clean in var_list:
+            return field
+
+    # Chill fuzzy matching — prevent false matches
+    match = process.extractOne(
+        clean,
+        EXPECTED_FIELDS_UPPER,
+        scorer=fuzz.partial_ratio
+    )
+
+    if match and match[1] >= threshold:
+        return match[0]
+
+    return None
+
 
 def fuzzy_match_field(text, threshold=70):
     """
@@ -208,7 +262,7 @@ def fuzzy_match_field(text, threshold=70):
         "TEMPAT/TGL LAHIR": ["TEMPAT TGL LAHIR", "TEMPAT/TGLLAHIR"],
         "JENIS KELAMIN": ["JENIS KELAMIN", "JENISKELAMIN"],
         "GOL DARAH": ["GOL. DARAH", "GOLDARAH"],
-        "RT/RW": ["RT RW", "RTRW"],
+        "RT/RW": ["RT RW", "AT/RW", "RTRW", "AT RW", "AT/RW", "ATAW"],  
         "KEL/DESA": ["KEL DESA", "KELDESA"],
         "STATUS PERKAWINAN": ["STATUSPERKAWINAN"],
         "BERLAKU HINGGA": ["BERLAKUHINGGA"]
@@ -248,7 +302,7 @@ def exact_field_match(text):
         "JENIS KELAMIN": ["JENIS", "KELAMIN", "JENISKELAMIN"],
         "GOL DARAH": ["GOL", "DARAH", "GOL.DARAH", "GOLDARAH"],
         "ALAMAT": ["ALAMAT"],
-        "RT/RW": ["RT/RW", "RTRW", "RT", "RW"],
+        "RT/RW": ["RT/RW", "RTRW", "RT", "RW", "AT/RW", "AT RW"],  # ADDED HERE
         "KEL/DESA": ["KEL/DESA", "KEL", "DESA", "KELDESA"],
         "KECAMATAN": ["KECAMATAN", "KEC"],
         "AGAMA": ["AGAMA"],
@@ -649,16 +703,6 @@ def parse_blood_type_character_based(text, threshold=80):
 def clean_text(text):
     return text.strip()
 
-# def extract_value(line):
-#     """Extract value after ':' and clean it"""
-#     if ':' in line:
-#         parts = line.split(':', 1)
-#         value = parts[1].strip()
-#         # Remove any leading colon that might remain
-#         if value.startswith(':'):
-#             value = value[1:].strip()
-#         return value
-#     return ''
 
 def is_field_name(text, threshold=60):
     """
@@ -772,6 +816,9 @@ def parse_ktp_fields(text_lines):
     processed_fields = set()
     # Store all dates found in the document
     all_dates_in_doc = []
+    
+    # Convert all lines to uppercase for easier matching
+    upper_lines = [line.upper() for line in lines]
     
     i = 0
     while i < len(lines):
@@ -970,25 +1017,34 @@ def parse_ktp_fields(text_lines):
                 continue
         
         # === RT/RW ===
-        elif "RT_RW" not in processed_fields and ("RT/RW" in upper_line or "RTRW" in upper_line or "RT" in upper_line and "RW" in upper_line):
+        elif "RT_RW" not in processed_fields and (
+            re.search(r"[RA]T\s*/\s*[RWA]W", upper_line) or 
+            re.search(r"R?T\s*R?W", upper_line)
+        ):
             val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in [":", ""]:
+
+            # value after colon on same line
+            if ":" in line:
+                val = line.split(":", 1)[1].strip()
+
+            # if this line has no number, use next line
+            if not val or not re.search(r"\d{2,3}\s*/\s*\d{2,3}", val):
                 if i + 1 < len(lines):
                     next_line = lines[i + 1]
-                    if re.search(r'\d{2,3}\s*[/\\]\s*\d{2,3}', next_line):
+                    if re.search(r"\d{2,3}\s*/\s*\d{2,3}", next_line):
                         val = next_line.strip()
                         i += 1
-            
+
+            # save cleaned RT/RW
             if val:
-                # Clean RT/RW format
-                val_clean = re.sub(r'[^0-9/]', '', val)
-                ktp_data["RT_RW"] = val_clean
-                processed_fields.add("RT_RW")
-                i += 1
-                continue
+                ktp_data["Rt_Rw"] = re.sub(r"[^0-9/]", "", val)
+            else:
+                ktp_data["Rt_Rw"] = ""
+
+            processed_fields.add("RT_RW")
+            i += 1
+            continue
+
         
         # === KEL/DESA ===
         elif "KEL_DESA" not in processed_fields and ("KEL" in upper_line or "DESA" in upper_line):
@@ -1014,12 +1070,25 @@ def parse_ktp_fields(text_lines):
                 val = line.split(':', 1)[1].strip()
             
             if not val or val in ["AGAMA", ":", ""]:
-                if i + 1 < len(lines):
+                # Check if the value is on the same line after "AGAMA"
+                # e.g., "Agama KAISTEN"
+                parts = line.split(maxsplit=1)
+                if len(parts) > 1 and parts[0].upper() == "AGAMA":
+                    val = parts[1].strip()
+                elif i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
-                    # Check if next line looks like a religion
-                    if any(religion in next_line.upper() for religion in ["ISLAM", "KRISTEN", "KATOLIK", "HINDU", "BUDDHA", "KONGHUCU"]):
+                    # Don't skip if next line looks like a value (not a field)
+                    if not fuzzy_match_field(next_line):
                         val = next_line
                         i += 1
+            
+            if val:
+                # Apply fuzzy matching for religion
+                matched_val = fuzzy_match_value("AGAMA", val)
+                ktp_data["Agama"] = matched_val if matched_val else val
+                processed_fields.add("AGAMA")
+                i += 1
+                continue
             
             if val:
                 # Apply fuzzy matching for religion
@@ -1262,13 +1331,18 @@ def safe_ocr_internal(image_path):
         if sys.platform == "win32":
             line = process.stdout.readline()
             if line:
-                return json.loads(line.strip())
+                response = json.loads(line.strip())
+                # ✅ UPDATE: Handle new line-based response format
+                # The response now contains "raw_text" as lines, not individual words
+                if "raw_text" in response:
+                    return response
         else:
             ready, _, _ = select.select([process.stdout], [], [], 0.1)
             if ready:
                 line = process.stdout.readline().strip()
                 if line:
-                    return json.loads(line)
+                    response = json.loads(line)
+                    return response
         
         time.sleep(0.1)
     
@@ -1342,10 +1416,15 @@ def enhanced_ktp_processing(image_path: str):
             })
         
         text_lines = worker_output.get("raw_text", [])
+        
+        # Log the received lines for debugging
+        logger.info(f"OCR returned {len(text_lines)} lines")
+        for i, line in enumerate(text_lines):
+            logger.info(f"Line {i+1}: {line}")
+        
         confidence_info = {
             "mean_confidence": worker_output.get("mean_confidence", 0),
-            "min_confidence": worker_output.get("min_confidence", 0),
-            "max_confidence": worker_output.get("max_confidence", 0)
+            "line_count": len(text_lines)
         }
         
         if worker_output.get("error"):
@@ -1371,13 +1450,14 @@ def enhanced_ktp_processing(image_path: str):
             normalized_val = fuzzy_match_value(clean_key.upper(), val)
             normalized_data[clean_key] = normalized_val
         
-        # Build output
+        # Build output WITHOUT formatted_text
         output_json = json.dumps({
-            "raw_text": text_lines,
+            "raw_text": text_lines,  # Original lines without line numbers
             "extracted_data": normalized_data,
             "confidence_info": confidence_info
         }, indent=2, ensure_ascii=False)
         
+        # Return 3 values: text_lines, normalized_data, output_json
         return text_lines, normalized_data, output_json
         
     except TimeoutException as e:

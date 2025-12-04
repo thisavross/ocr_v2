@@ -11,6 +11,7 @@ import sys
 import logging
 import traceback
 import time
+import re
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,17 +68,43 @@ def main():
                 doc = DocumentFile.from_images(line)
                 result = model(doc)
 
-                words = []
+                # Group words by lines and preserve line structure
+                structured_lines = []
+                raw_words = []
+                
                 for page in result.pages:
                     for block in page.blocks:
-                        for l in block.lines:
-                            for w in l.words:
-                                words.append(w.value)
+                        for line_obj in block.lines:
+                            # Get all words in this line
+                            line_words = []
+                            for word_obj in line_obj.words:
+                                word_text = word_obj.value
+                                line_words.append(word_text)
+                                raw_words.append(word_text)
+                            
+                            # Join words in the line with spaces
+                            if line_words:
+                                line_text = " ".join(line_words)
+                                structured_lines.append(line_text)
+                
+                # Calculate mean confidence if needed
+                mean_confidence = 0.0
+                confidences = []
+                for page in result.pages:
+                    for block in page.blocks:
+                        for line_obj in block.lines:
+                            for word_obj in line_obj.words:
+                                if hasattr(word_obj, 'confidence'):
+                                    confidences.append(word_obj.confidence)
+                
+                if confidences:
+                    mean_confidence = sum(confidences) / len(confidences)
 
                 output = {
-                    "raw_text": words,
-                    "mean_confidence": 0.85,  # placeholder
-                    "error": None
+                    "raw_text": structured_lines,  # Now returns lines instead of individual words
+                    "mean_confidence": mean_confidence,
+                    "error": None,
+                    "line_count": len(structured_lines)
                 }
 
                 print(json.dumps(output))
