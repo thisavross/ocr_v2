@@ -28,7 +28,7 @@ def main():
         from doctr.io import DocumentFile
         model = ocr_predictor(
             det_arch="db_resnet50",
-            reco_arch="sar_resnet31",
+            reco_arch="crnn_vgg16_bn",
             pretrained=True,
             assume_straight_pages=False,
             preserve_aspect_ratio=True,
@@ -88,7 +88,7 @@ def main():
                                 structured_lines.append(line_text)
                 
                 # Calculate mean confidence if needed
-                mean_confidence = 0.0
+                mean_confidence = 0.7
                 confidences = []
                 for page in result.pages:
                     for block in page.blocks:
@@ -100,8 +100,21 @@ def main():
                 if confidences:
                     mean_confidence = sum(confidences) / len(confidences)
 
+                # === REJECT LOW CONFIDENCE IMMEDIATELY ===
+                if mean_confidence < 0.70:
+                    output = {
+                        "raw_text": structured_lines,
+                        "mean_confidence": mean_confidence,
+                        "error": f"low_confidence:{mean_confidence:.3f}",
+                        "line_count": len(structured_lines),
+                        "status": "rejected"
+                    }
+                    print(json.dumps(output))
+                    sys.stdout.flush()
+                    continue
+
                 output = {
-                    "raw_text": structured_lines,  # Now returns lines instead of individual words
+                    "raw_text": structured_lines,  
                     "mean_confidence": mean_confidence,
                     "error": None,
                     "line_count": len(structured_lines)

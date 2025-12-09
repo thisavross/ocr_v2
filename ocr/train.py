@@ -1,10 +1,12 @@
 import functools
 from multiprocessing import Process
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import re
+import traceback
 from PIL import Image, ImageFilter
 import Levenshtein
 import numpy as np
@@ -16,6 +18,7 @@ import threading
 import time
 import select
 from contextlib import contextmanager
+import psutil
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 import concurrent.futures
@@ -53,1167 +56,609 @@ def time_limit(seconds):
     """Context manager for timeouts using threads"""
     def timeout_handler():
         time.sleep(seconds)
-        raise TimeoutException(f"Operation timed out after {seconds} seconds")
+        import sys
+        if not timer_done[0]:
+            raise TimeoutException(f"Operation timed out after {seconds} seconds")
     
-    # Start a timer thread
+    timer_done = [False]
     timer = threading.Thread(target=timeout_handler)
     timer.daemon = True
     timer.start()
     
     try:
         yield
+        timer_done[0] = True
     except TimeoutException:
         raise
     finally:
-        # Try to stop the timer (though it's daemonized)
-        pass
+        timer_done[0] = True
 
-    
-# Pre-compile frequently used regex patterns (SPEED BOOST)
-BLOOD_TYPE_PATTERNS = [
-    re.compile(r'GOLDARAH\s*:?\s*([ABO]+)', re.IGNORECASE),
-    re.compile(r'GOL\.?\s*DARAH\s*:?\s*([ABO]+)', re.IGNORECASE),
-    re.compile(r'DARAH\s*:?\s*([ABO]+)', re.IGNORECASE),
-    re.compile(r'([ABO]{1,2})\s*$', re.IGNORECASE),
-    re.compile(r':\s*([ABO]{1,2})\s*', re.IGNORECASE),
-]
 
-EMPTY_BLOOD_PATTERNS = [
-    re.compile(r'GOL\.?\s*DARAH\s*:?\s*-$', re.IGNORECASE),
-    re.compile(r'GOL\.?\s*DARAH\s*:?\s*$', re.IGNORECASE)
-]
+# ========== COMPILED REGEX PATTERNS (FASTER) ==========
+# SIMPLIFY these patterns - they're too broad
+DATE_PATTERN = re.compile(r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b')  
+RT_RW_PATTERN = re.compile(r'\b(\d{2,3})\s*[/|]\s*(\d{2,3})\b') 
 
+
+# Use compiled patterns for better performance
+PROVINCE_PATTERN = re.compile(r'^PROVINSI\s*(.*)', re.IGNORECASE)
+NIK_PATTERN = re.compile(r'(\d{16}|\d{10,20}|[0-9OIlS]{16})')
 DATE_PATTERN = re.compile(r'\d{1,2}[-/]\d{1,2}[-/]\d{2,4}')
-NIK_PATTERN = re.compile(r'[A-Z0-9]{16,}')
-DIGIT_PATTERN = re.compile(r'\d{8,}')
+BLOOD_TYPE_PATTERN = re.compile(
+    r'\b([ABO]|0)[\+\-]?\b',
+    re.IGNORECASE
+)
+RT_RW_PATTERN = re.compile(r'(\d{2,3})\s*[/|]\s*(\d{2,3})')
+
+# Pre-compiled field patterns
+FIELD_PATTERNS = {
+    "PROVINSI": re.compile(r'PROVINSI', re.IGNORECASE),
+    "KABUPATEN": re.compile(r'KABUPATEN', re.IGNORECASE),
+    "KOTA": re.compile(r'KOTA', re.IGNORECASE),  
+    "KECAMATAN": re.compile(r'KECAMATAN', re.IGNORECASE),  
+    "NIK": re.compile(r'NIK', re.IGNORECASE),
+    "NAMA": re.compile(r'NAMA', re.IGNORECASE),
+    "TEMPAT_TGL_LAHIR": re.compile(r'TEMPAT\s*[/|]?\s*T?GL?\s*LAHIR', re.IGNORECASE),
+    "JENIS_KELAMIN": re.compile(r'JENIS\s*KELAMIN', re.IGNORECASE),
+    "GOL_DARAH": re.compile(r'GOL\.?\s*DARAH', re.IGNORECASE),
+    "ALAMAT": re.compile(r'ALAMAT', re.IGNORECASE),
+    "RT_RW": re.compile(r'R?T\s*[/|]?\s*R?W', re.IGNORECASE),
+    "KEL_DESA": re.compile(r'KEL\s*[/|]?\s*DESA', re.IGNORECASE),
+    "AGAMA": re.compile(r'AGAMA', re.IGNORECASE),
+    "PEKERJAAN": re.compile(r'PEKERJAAN', re.IGNORECASE),
+    "KEWARGANEGARAAN": re.compile(r'KEWARGANEGARAAN', re.IGNORECASE),
+    "BERLAKU_HINGGA": re.compile(r'BERLAKU\s*HINGGA', re.IGNORECASE),
+}
+
+# Fix FIELD_MAPPING - lists should not be used as values
+FIELD_MAPPING = {
+    "Provinsi": "Provinsi",
+    "Kota_Kabupaten": "Kota_Kabupaten", 
+    "NIK": "NIK",
+    "Nama": "Nama",
+    "Tempat_Tgl_Lahir": "Tempat_Tgl_Lahir",
+    "Jenis_Kelamin": "Jenis_Kelamin",
+    "Gol_Darah": "Gol_Darah",
+    "Alamat": "Alamat",
+    "Rt_Rw": "Rt_Rw",
+    "Kel_Desa": "Kel_Desa",
+    "Kecamatan": "Kecamatan",
+    "Agama": "Agama",
+    "Pekerjaan": "Pekerjaan",
+    "Kewarganegaraan": "Kewarganegaraan",
+    "Tanggal_Terbit": "Tanggal_Terbit",
+    "Berlaku_Hingga": "Berlaku_Hingga"
+}
 
 
-# Pre-compute uppercase versions for faster matching (SPEED BOOST)
-EXPECTED_FIELDS_UPPER = [
-    "PROVINSI", "KOTA", "KABUPATEN", "NIK", "NAMA", "TEMPAT/TGL LAHIR",
-    "JENIS KELAMIN","GOL DARAH", "ALAMAT", "RT/RW", "KEL/DESA", "KECAMATAN",
-    "AGAMA", "STATUS PERKAWINAN", "PEKERJAAN", "KEWARGANEGARAAN", "BERLAKU HINGGA"
+REQUIRED_FIELDS = [
+    "NIK", "Nama", "Tempat_Tgl_Lahir", "Jenis_Kelamin",
+    "Alamat", "Kel_Desa", "Pekerjaan",
+    "Kewarganegaraan", "Tanggal_Terbit", "Berlaku_Hingga"
 ]
-EXPECTED_FIELDS_SET = set(EXPECTED_FIELDS_UPPER)
-
+# Controlled values with corrections
 CONTROLLED_VALUES = {
-    "JENIS KELAMIN" : ["LAKILAKI", "PEREMPUAN"],
-    "GOL_DARAH" : ["A", "B", "AB", "O"],
-    "STATUS PERKAWINAN" : ["BELUM KAWIN", "KAWIN", "CERAI HIDUP", "CERAI MATI"],
-    "AGAMA" : ["BUDDHA", "HINDU", "ISLAM", "KATOLIK", "KRISTEN", "KONGHUCU", "KEPERCAYAAN"]
+    "Jenis_Kelamin": {
+        "LAKI-LAKI": ["LAKILAKI", "LAKILAK", "LAKILAKT", "LAKILAKI", "LAKI LAKI", "MALE"],
+        "PEREMPUAN": ["PEREMPUAN", "PEREMPUA", "PEREMPUAN","FEMALES"]
+    },
+    "Agama": {
+        "ISLAM": ["ISLAM", "ISLAM", "ISLAM"],
+        "KRISTEN": ["KRISTEN", "KRISTEN", "KAISTEN", "CHRISTIAN"],
+        "KATOLIK": ["KATOLIK", "KATHOLIK"],
+        "BUDDHA": ["BUDDHA", "BUDHA"],
+        "HINDU": ["HINDU"],
+        "KONGHUCU": ["KONGHUCU"]
+    },
 }
-
-# Pre-compute uppercase controlled values (SPEED BOOST)
-CONTROLLED_VALUES_UPPER = {
-    key: [v.upper() for v in values] 
-    for key, values in CONTROLLED_VALUES.items()
-}
-
-CONTROLLED_LOOKUP = {}
-for field, values in CONTROLLED_VALUES.items():
-    for v in values:
-        CONTROLLED_LOOKUP[v.upper()] = (field, v)
-        
-# Create a set for O(1) lookups of perfect field matches
-EXPECTED_FIELDS_SET = set(EXPECTED_FIELDS_UPPER)
-# OPTIMIZED FUZZY MATCHING WITH PERFECT MATCH SKIPPING 
-def fuzzy_match_value(field, value, threshold=60):
-    """
-    Optimized fuzzy matching with perfect match skipping.
-    If field has controlled values, do fuzzy matching to correct OCR errors.
-    """
-    if field not in CONTROLLED_VALUES:
-        return value  # No controlled list for this field
-    
-    # Skip fuzzy matching for perfect matches 
-    value_upper = value.upper()
-    controlled_list_upper = CONTROLLED_VALUES_UPPER[field]
-    
-    # 1. Check for exact match first 
-    if value_upper in controlled_list_upper:
-        idx = controlled_list_upper.index(value_upper)
-        return CONTROLLED_VALUES[field][idx]
-    
-    # 2. Check for common OCR variations 
-    corrected = quick_ocr_correction(value_upper, field)
-    if corrected:
-        return corrected
-    
-    # 3. Only then use fuzzy matching 
-    match = process.extractOne(value_upper, controlled_list_upper, scorer=fuzz.ratio)
-    if match and match[1] >= threshold:
-        idx = controlled_list_upper.index(match[0])
-        return CONTROLLED_VALUES[field][idx]
-    
-    return value  # return original if no good match
-
-def quick_ocr_correction(value_upper, field):
-    """Quick corrections for common OCR errors without fuzzy matching"""
-    if field == "JENIS KELAMIN":
-        # Common OCR errors for gender
-        corrections = {
-            "LAKILAKI": ["LAKILAKI", "LAKI-LAKI", "LAKI LAKI", "LAKILAK"],
-            "PEREMPUAN": ["PEREMPUAN", "PEREMPUAN", "PEREMPUA", "PEREMPWN"]
-        }
-        for correct, variants in corrections.items():
-            if value_upper in variants:
-                return correct
-    
-    elif field == "AGAMA":
-        # Common OCR errors for religion
-        corrections = {
-            "ISLAM": ["ISLAM", "ISIAM", "ISLAM", "ISLAM"],
-            "KRISTEN": ["KRISTEN", "KRISTEN", "KRISTEN", "KAISTEN"],
-            "KATOLIK": ["KATOLIK", "KATOLIK", "KATOLLK"],
-            "HINDU": ["HINDU", "HINDU", "HINDU"],
-            "BUDDHA": ["BUDDHA", "BUDHA", "BUDDHA"],
-            "KONGHUCU": ["KONGHUCU", "KONGHUCU", "KONGHUCU"]
-        }
-        for correct, variants in corrections.items():
-            if value_upper in variants:
-                return correct
-    
-    elif field == "STATUS PERKAWINAN":
-        # Common OCR errors for marital status
-        corrections = {
-            "BELUM KAWIN": ["BELUM KAWIN", "BELUMKAWIN", "BELUM KAWIN", "BELOM KAWIN"],
-            "KAWIN": ["KAWIN", "KAWIN", "KAWIN"],
-            "CERAI HIDUP": ["CERAI HIDUP", "CERAIHIDUP", "CERAI HIDUP"],
-            "CERAI MATI": ["CERAI MATI", "CERAIMATI", "CERAI MATI"]
-        }
-        for correct, variants in corrections.items():
-            if value_upper in variants:
-                return correct
-    
-    return None
 
 def fuzzy_match_field(text, threshold=75):
-    """
-    Match ONLY real KTP field names.
-    NEVER match values 
-    """
-    if not text or not text.strip():
+    """Fuzzy match text to expected KTP field names with aggressive cleanup"""
+    if not text.strip():
         return None
 
-    clean = re.sub(r'[^A-Z0-9/ ]', '', text.upper()).strip()
-
-    # Fast exact match
-    if clean in EXPECTED_FIELDS_SET:
-        return clean
-
-    # Only match if clean TOKEN (one word)
-    # Values like "KAISTEN", "TANJUNG MORAWA" won't match anymore
-    if " " in clean:
-        return None
-
-    # Common variations
-    field_variations = {
-        "PROVINSI": ["PROVINSI", "PROV", "PROVINS"],
-        "KABUPATEN": ["KABUPATEN", "KAB", "KABUPATEN"],
-        "TEMPAT/TGL LAHIR": ["TEMPAT TGL LAHIR", "TEMPAT/TGLLAHIR"],
-        "JENIS KELAMIN": ["JENIS KELAMIN", "JENISKELAMIN"],
-        "GOL DARAH": ["GOL. DARAH", "GOLDARAH"],
-        "RT/RW": ["RT RW", "AT/RW", "RTRW", "AT RW", "AT/RW", "ATAW"],  
-        "KEL/DESA": ["KEL DESA", "KELDESA"],
-        "STATUS PERKAWINAN": ["STATUSPERKAWINAN"],
-        "BERLAKU HINGGA": ["BERLAKUHINGGA"]
-    }
-    for field, var_list in field_variations.items():
-        if clean in var_list:
-            return field
-
-    # Chill fuzzy matching — prevent false matches
-    match = process.extractOne(
-        clean,
-        EXPECTED_FIELDS_UPPER,
-        scorer=fuzz.partial_ratio
-    )
-
+    # remove all non-alphabetic characters (colon, dots, commas, OCR noise)
+    cleaned = re.sub(r'[^A-Z]', '', text.upper())
+    
+    # Use keys from FIELD_MAPPING for matching
+    field_names = list(FIELD_MAPPING.keys())
+    
+    match = process.extractOne(cleaned, field_names, scorer=fuzz.ratio)
     if match and match[1] >= threshold:
-        return match[0]
-
+        # Return the actual field name to use (the value from FIELD_MAPPING)
+        return FIELD_MAPPING[match[0]]
     return None
 
 
-def fuzzy_match_field(text, threshold=70):
+def fuzzy_match_value(key, val, threshold=75):
     """
-    Optimized fuzzy field matching with perfect match skipping.
-    Fuzzy match text to expected KTP field names.
+    Fuzzy-correct value based on controlled list for the given key.
     """
-    if not text or not text.strip():
-        return None
+    if not val:
+        return val
+
+    val_up = val.upper().replace(" ", "")
     
-    # Clean and normalize text
-    clean_text = re.sub(r'[^A-Z0-9\s/]', '', text.upper())
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    # CONTROLLED_VALUES has nested structure, get the correct sub-dictionary
+    controlled_dict = CONTROLLED_VALUES.get(key, {})
     
-    # Early return if text becomes empty after cleaning
-    if not clean_text:
-        return None
+    if not controlled_dict:
+        return val  # No controlled values → return as is
+
+    # Normalize controlled values
+    controlled_list = []
+    controlled_to_original = {}
     
-    # 1. Check for perfect match first (FAST PATH - O(1))
-    if clean_text in EXPECTED_FIELDS_SET:
-        return clean_text
-    
-    # 2. Check for common field variations (FAST PATH)
-    field_variations = {
-        "PROVINSI": ["PROVINSI", "PROV", "PROVINS"],
-        "KABUPATEN": ["KABUPATEN", "KAB", "KABUPATEN"],
-        "TEMPAT/TGL LAHIR": ["TEMPAT TGL LAHIR", "TEMPAT/TGLLAHIR"],
-        "JENIS KELAMIN": ["JENIS KELAMIN", "JENISKELAMIN"],
-        "GOL DARAH": ["GOL. DARAH", "GOLDARAH"],
-        "RT/RW": ["RT RW", "AT/RW", "RTRW", "AT RW", "AT/RW", "ATAW"],  
-        "KEL/DESA": ["KEL DESA", "KELDESA"],
-        "STATUS PERKAWINAN": ["STATUSPERKAWINAN"],
-        "BERLAKU HINGGA": ["BERLAKUHINGGA"]
-    }
-    
-    for expected_field, variations in field_variations.items():
-        if clean_text in variations:
-            return expected_field
-    
-    # 3. Only then use fuzzy matching (SLOW PATH)
-    match = process.extractOne(clean_text, EXPECTED_FIELDS_UPPER, scorer=fuzz.partial_ratio)
-    
+    for correct_value, variations in controlled_dict.items():
+        controlled_list.append(correct_value.upper().replace(" ", ""))
+        controlled_to_original[correct_value.upper().replace(" ", "")] = correct_value
+        
+        for variation in variations:
+            normalized_variation = variation.upper().replace(" ", "")
+            controlled_list.append(normalized_variation)
+            controlled_to_original[normalized_variation] = correct_value
+
+    # 1️ Exact match
+    if val_up in controlled_to_original:
+        return controlled_to_original[val_up]
+
+    # 2️ Fuzzy match
+    match = process.extractOne(val_up, controlled_list, scorer=fuzz.ratio)
     if match and match[1] >= threshold:
-        return match[0]
-    
-    return None
+        return controlled_to_original.get(match[0], val)
 
-def exact_field_match(text):
-    """
-    Fast exact field matching without fuzzy logic.
-    Returns the field name if it's a perfect match or common variation.
-    """
-    text_upper = text.upper().strip()
+    return val
+
+# ========== OPTIMIZED PARSING FUNCTIONS ==========
+def extract_field_value(line, field_name):
+    """Extract value from a line that contains a field name"""
+    if ':' in line:
+        parts = line.split(':', 1)
+        if len(parts) == 2:
+            return parts[1].strip()
     
-    # Direct set lookup (fastest)
-    if text_upper in EXPECTED_FIELDS_SET:
-        return text_upper
+    # Try to extract after field name
+    field_pattern = FIELD_PATTERNS.get(field_name)
+    if field_pattern:
+        match = field_pattern.search(line)
+        if match:
+            # Get text after the field name
+            value = line[match.end():].strip()
+            # Clean up common prefixes
+            value = re.sub(r'^[:\-\s\.]+', '', value)
+            return value
     
-    # Common variations lookup
-    field_variations = {
-        "PROVINSI": ["PROVINSI"],
-        "KOTA": ["KOTA"], 
-        "KABUPATEN": ["KABUPATEN", "KAB"],
-        "NIK": ["NIK", "NIK:"],
-        "NAMA": ["NAMA", "NAMA:"],
-        "TEMPAT/TGL LAHIR": ["TEMPAT", "TGL", "LAHIR", "TEMPAT/TGL", "TEMPAT TGL"],
-        "JENIS KELAMIN": ["JENIS", "KELAMIN", "JENISKELAMIN"],
-        "GOL DARAH": ["GOL", "DARAH", "GOL.DARAH", "GOLDARAH"],
-        "ALAMAT": ["ALAMAT"],
-        "RT/RW": ["RT/RW", "RTRW", "RT", "RW", "AT/RW", "AT RW"],  # ADDED HERE
-        "KEL/DESA": ["KEL/DESA", "KEL", "DESA", "KELDESA"],
-        "KECAMATAN": ["KECAMATAN", "KEC"],
-        "AGAMA": ["AGAMA"],
-        "STATUS PERKAWINAN": ["STATUS", "PERKAWINAN", "STATUSPERKAWINAN"],
-        "PEKERJAAN": ["PEKERJAAN"],
-        "KEWARGANEGARAAN": ["KEWARGANEGARAAN"],
-        "BERLAKU HINGGA": ["BERLAKU", "HINGGA", "BERLAKUHINGGA"]
-    }
-    
-    for expected_field, variations in field_variations.items():
-        if text_upper in variations:
-            return expected_field
-    
-    return None
+    return line.strip()
 
 
-def extract_potential_nik_with_ocr_correction(text):
-    """Extract and correct potential NIK from text with OCR error handling"""
-    # Common OCR misreadings (number -> letter)
-    ocr_corrections = {
-        'O': '0', 'o': '0', 'Q': '0',
-        'I': '1', 'i': '1', 'l': '1', 'L': '1', '|': '1',
-        'Z': '2', 'z': '2',
-        'S': '5', 's': '5', 
-        'G': '6', 'g': '6',
-        'T': '7', 't': '7',
-        'B': '8', 'b': '8',
-        'A': '4', 'a': '4',
-        'E': '3', 'e': '3'
-    }
-    
-    # Look for sequences that could be NIK (16 chars with mix of digits/letters)
-    potential_matches = re.findall(r'[A-Z0-9]{16,}', text.upper())
-    
-    for match in potential_matches:
-        if len(match) >= 16:
-            # Apply OCR corrections
-            corrected = ''
-            for char in match:
-                if char in ocr_corrections:
-                    corrected += ocr_corrections[char]
-                else:
-                    corrected += char
-            
-            # Take only the first 16 characters
-            corrected = corrected[:16]
-            
-            # Check if it's a valid NIK after correction
-            if validate_nik(corrected):
-                return corrected
-    
-    return None
-
-def correct_nik_ocr(text):
-    """Correct common OCR misreadings in NIK"""
-    if not text:
-        return None
-    
-    # Common OCR misreadings (letter -> number)
-    ocr_corrections = {
-        'O': '0', 'o': '0',
-        'I': '1', 'i': '1', 'l': '1', 'L': '1',
-        'S': '5', 's': '5',
-        'B': '8', 'b': '8',
-        'Z': '2', 'z': '2',
-        'G': '6', 'g': '6',
-        'T': '7', 't': '7',
-        'Q': '9', 'q': '9',
-        'E': '3', 'e': '3',
-        'A': '4', 'a': '4'
-    }
-    
-    # Apply corrections
-    corrected = ''
-    for char in text:
-        if char in ocr_corrections:
-            corrected += ocr_corrections[char]
-        elif char.isdigit():
-            corrected += char
-        # Ignore non-alphanumeric characters
-    
-    return corrected
-
-def enhanced_nik_extraction(text_lines):
-    """Extract NIK using multiple fuzzy strategies"""
-    
-    def find_nik_line_index(text_lines):
-        """Find the line containing NIK using fuzzy matching"""
-        for i, line in enumerate(text_lines):
-            line_upper = line.upper().strip()
-            
-            # Fuzzy match with common NIK patterns
-            nik_scores = [
-                fuzz.partial_ratio(line_upper, "NIK"),
-                fuzz.partial_ratio(line_upper, "NIK:"),
-            ]
-            
-            if max(nik_scores) >= 75:
-                return i
-        return -1
-    
-    nik_line_idx = find_nik_line_index(text_lines)
-    
-    if nik_line_idx == -1:
-        return None
-    
-    # Strategy 1: Check next line (most common format)
-    if nik_line_idx + 1 < len(text_lines):
-        next_line = text_lines[nik_line_idx + 1].strip()
-        corrected = correct_nik_ocr(next_line)
-        if validate_nik(corrected):
-            return corrected
-    
-    # Strategy 2: Check current line (NIK and value might be together)
-    current_line = text_lines[nik_line_idx]
-    parts = re.split(r'[\s:]', current_line)
-    
-    for part in parts:
-        if len(part) >= 16:  # Potential NIK value
-            corrected = correct_nik_ocr(part)
-            if validate_nik(corrected):
-                return corrected
-    
-    # Strategy 3: Extract all potential 16-character sequences
-    all_text = ' '.join(text_lines)
-    potential_niks = re.findall(r'[A-Z0-9]{16,}', all_text)
-    
-    for potential in potential_niks:
-        corrected = correct_nik_ocr(potential)
-        if validate_nik(corrected):
-            return corrected
-    
-    return None
-
-def validate_nik(nik):
-    """Validate NIK format"""
-    if not nik or len(nik) != 16:
-        return False
-    return nik.isdigit()
-
-#KTP LINE PARSING
-def parse_ktp_lines(lines):
-    """
-    Optimized KTP line parsing with early returns for perfect matches.
-    Parse OCR lines into structured key-value pairs.
-    """
-    data = {}
-    skip_next = False
-    processed_fields = set()  # Track processed fields to avoid duplicates
-
-    for i, raw_line in enumerate(lines):
-        if skip_next:
-            skip_next = False
-            continue
-
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # --- Case 1: Normal 'key: value' line (FAST PATH) ---
-        if ':' in line:
-            key, value = line.split(':', 1)
-            key_clean = key.strip().replace('/', '_').replace(' ', '_')
-            value_clean = value.strip()
-            
-            # Skip if we've already processed this field
-            if key_clean in processed_fields:
-                continue
-                
-            # Try exact field matching first
-            field_match = exact_field_match(key.strip())
-            if field_match:
-                data[field_match] = value_clean
-                processed_fields.add(field_match)
-                continue
-            else:
-                # Fall back to original logic
-                data[key_clean] = value_clean
-                continue
-
-        # --- Case 2: Next line starts with ':' ---
-        if i + 1 < len(lines) and lines[i+1].strip().startswith(':'):
-            key_clean = line.strip().replace('/', '_').replace(' ', '_')
-            value = lines[i+1].strip(': ').strip()
-            
-            if key_clean not in processed_fields:
-                data[key_clean] = value
-                processed_fields.add(key_clean)
-                skip_next = True
-                continue
-
-        # --- Case 3: Line looks like "PROVINSI XXX" (no ':') ---
-        parts = line.split(maxsplit=1)
-        if len(parts) >= 2:
-            possible_key = parts[0]
-            
-            # Try exact match first
-            field_match = exact_field_match(possible_key)
-            if field_match and field_match not in processed_fields:
-                data[field_match] = parts[1].strip()
-                processed_fields.add(field_match)
-                continue
-            
-            # Then try fuzzy match
-            matched_field = fuzzy_match_field(possible_key)
-            if matched_field and matched_field not in processed_fields:
-                field_key = matched_field.replace('/', '_').replace(' ', '_')
-                data[field_key] = parts[1].strip()
-                processed_fields.add(field_key)
-                continue
-
-        # --- Case 4: Fuzzy match whole line to expected field ---
-        matched_field = fuzzy_match_field(line)
-        if matched_field and matched_field not in processed_fields:
-            field_key = matched_field.replace('/', '_').replace(' ', '_')
-            
-            # If next line looks like a value, grab it
-            if i + 1 < len(lines) and not fuzzy_match_field(lines[i+1]):
-                data[field_key] = lines[i+1].strip()
-                skip_next = True
-            else:
-                data[field_key] = ""
-            processed_fields.add(field_key)
-            continue
-
-        # --- Case 5: Handle special numeric-only fields like NIK ---
-        if "NIK" not in processed_fields:
-            # Strategy 1: Quick digit-only check (fastest path for clean OCR)
-            digit_only_nik = re.search(r'\b(\d{16})\b', line)
-            if digit_only_nik:
-                data["NIK"] = digit_only_nik.group(1)
-                processed_fields.add("NIK")
-                continue
-            
-            # Strategy 2: OCR-corrected extraction (handles B→8, O→0, etc.)
-            potential_nik = extract_potential_nik_with_ocr_correction(line)
-            if potential_nik:
-                data["NIK"] = potential_nik
-                processed_fields.add("NIK")
-                continue
-
-    return data
-
-# ========== OPTIMIZED BLOOD TYPE PARSING ==========
-
-def normalize_blood_type(text):
-    """Normalize blood type text before parsing"""
-    if not text:
+def fix_tempat_tgl_lahir(value):
+    """Fix common issues in Tempat_Tgl_Lahir field"""
+    if not value:
         return ""
     
-    # Convert to uppercase and strip
-    text = text.upper().strip()
+    # Remove common OCR artifacts
+    value = re.sub(r'^[/:\-\s\.]+', '', value)  # Remove leading symbols
+    value = re.sub(r'[Tt]gl\s*[Ll]ahir\s*[\.:]?\s*', '', value)  # Remove "Tgl Lahir" text
+    value = re.sub(r'Tempat\s*[/|]?\s*', '', value, flags=re.IGNORECASE)  # Remove "Tempat/"
     
-    # Common OCR errors for blood types
-    blood_type_corrections = {
-        '0': 'O',  # Zero to letter O
-        'O': 'O',  # Ensure consistent
-        'A': 'A',
-        'B': 'B',
-        'AB': 'AB',
-        'ABO': 'AB',  # Handle extra characters
-        'BO': 'B',
-        'AO': 'A'
+    # Fix common OCR errors
+    corrections = {
+        'ahr ': '', 'ahir ': '', '/Tal ': '', '/Tg ': ''
     }
+    for wrong, correct in corrections.items():
+        value = value.replace(wrong, correct)
     
-    # Extract only blood type characters
-    blood_chars = re.sub(r'[^ABO0]', '', text)
+    # Ensure proper format
+    if ', ' not in value and re.search(r'\d', value):
+        # Add comma if missing before date
+        value = re.sub(r'(\D)(\d{1,2}-\d{1,2}-\d{4})', r'\1, \2', value)
     
-    # Apply corrections
-    if blood_chars in blood_type_corrections:
-        return blood_type_corrections[blood_chars]
-    
-    return text
+    return value.strip()
 
-def parse_blood_type_comprehensive(text, threshold=70):
-    """Optimized blood type parsing with early returns"""
-    if not text or text.strip() in ['', '-']:
-        return None
+def normalize_controlled_value(field, value):
+    """Normalize controlled values using direct mapping"""
+    if not value:
+        return value
     
-    text_upper = text.upper()
+    value_upper = value.upper().strip()
     
-    # Check for empty blood type patterns using pre-compiled patterns
-    for pattern in EMPTY_BLOOD_PATTERNS:
-        if pattern.search(text_upper):
-            return None
-    
-    # Direct normalization and exact match (FAST PATH)
-    normalized = normalize_blood_type(text)
-    if normalized in ["A", "B", "AB", "O"]:
-        return normalized
-    
-    # Stage 2: Quick pattern check for common formats
-    quick_patterns = [
-        (r'GOL\.?DARAH\s*:?\s*([ABO])', 1),  # "GOLDARAH:A"
-        (r'DARAH\s*:?\s*([ABO])', 1),        # "DARAH:B"  
-        (r'^([ABO])$', 1),                   # Standalone "A"
-        (r':\s*([ABO])\s*$', 1),             # ": A"
-    ]
-    
-    for pattern, group in quick_patterns:
-        match = re.search(pattern, text_upper)
-        if match:
-            blood_type = match.group(group)
-            normalized = normalize_blood_type(blood_type)
-            if normalized in ["A", "B", "AB", "O"]:
-                return normalized
-    
-    #  Full pattern extraction with pre-compiled patterns
-    for pattern in BLOOD_TYPE_PATTERNS:
-        match = pattern.search(text_upper)
-        if match:
-            blood_type = match.group(1)
-            # Skip if we matched just a dash or empty
-            if blood_type.strip() in ['', '-']:
-                continue
-            normalized = normalize_blood_type(blood_type)
-            if normalized in ["A", "B", "AB", "O"]:
-                return normalized
-    
-    # Character-based fuzzy matching 
-    char_based_match = parse_blood_type_character_based(text, threshold)
-    if char_based_match:
-        return char_based_match
-    
-    # Stage 5: Direct character search
-    for char in text_upper:
-        normalized_char = normalize_blood_type(char)
-        if normalized_char in ["A", "B", "AB", "O"]:
-            return normalized_char
-    
-    return None
-
-# blood type helper functions 
-def jaro_winkler_similarity(s1, s2):
-    """Calculate Jaro-Winkler similarity between two strings"""
-    return JaroWinkler.similarity(s1, s2) * 100
-
-def levenshtein_similarity(s1, s2):
-    """Calculate Levenshtein similarity between two strings"""
-    max_len = max(len(s1), len(s2))
-    if max_len == 0:
-        return 100
-    distance = Levenshtein.distance(s1, s2)
-    return (1 - distance / max_len) * 100
-
-def parse_blood_type_character_based(text, threshold=80):
-    """Use character-level distance metrics for blood type parsing"""
-    if not text:
-        return None
-    
-    normalized = normalize_blood_type(text)
-    controlled_values = ["A", "B", "AB", "O"]
-    
-    # Try multiple character-based scorers
-    scorers = [
-        ("ratio", fuzz.ratio),
-        ("partial_ratio", fuzz.partial_ratio),
-        ("token_sort_ratio", fuzz.token_sort_ratio),
-        ("jaro_winkler", jaro_winkler_similarity),
-        ("levenshtein", levenshtein_similarity)
-    ]
-    
-    best_overall_match = None
-    best_overall_score = 0
-    
-    for scorer_name, scorer in scorers:
-        try:
-            best_match, score, _ = process.extractOne(
-                normalized,
-                controlled_values,
-                scorer=scorer
-            )
-            
-            if score > best_overall_score:
-                best_overall_score = score
-                best_overall_match = best_match
-                
-        except Exception as e:
-            continue
-    
-    # Special handling for single character matches
-    if len(normalized) == 1:
-        single_char_scores = {}
-        for blood_type in controlled_values:
-            # For single char input, check if it matches any character in blood type
-            if normalized in blood_type:
-                similarity = fuzz.ratio(normalized, blood_type)
-                single_char_scores[blood_type] = similarity
+    if field in CONTROLLED_VALUES:
+        for correct_value, variations in CONTROLLED_VALUES[field].items():
+            if value_upper in variations or value_upper == correct_value.upper():
+                return correct_value
         
-        if single_char_scores:
-            best_single_char = max(single_char_scores.items(), key=lambda x: x[1])
-            if best_single_char[1] > best_overall_score:
-                best_overall_match, best_overall_score = best_single_char
-    
-    return best_overall_match if best_overall_score >= threshold else None
-
-
-def clean_text(text):
-    return text.strip()
-
-
-def is_field_name(text, threshold=60):
-    """
-    Universal check if text is a field name/key.
-    Returns True if text matches any field name (even fuzzily).
-    """
-    if not text or not text.strip():
-        return False
-    
-    text_upper = text.upper().strip()
-    
-    # Quick exact matches
-    if text_upper in EXPECTED_FIELDS_SET:
-        return True
-    
-    # Check for common field patterns
-    field_patterns = [
-        r'^(PROVINSI|KOTA|KABUPATEN|NIK|NAMA|TEMPAT|TGL|LAHIR|JENIS|KELAMIN|'
-        r'GOL|DARAH|ALAMAT|RT|RW|KEL|DESA|KECAMATAN|AGAMA|STATUS|PERKAWINAN|'
-        r'PEKERJAAN|KEWARGANEGARAAN|BERLAKU|HINGGA)$',
-        r'^[A-Z]{4,}$',  # All caps words of 4+ letters (often field names)
-    ]
-    
-    for pattern in field_patterns:
-        if re.match(pattern, text_upper):
-            return True
-    
-    # Fuzzy match check
-    matched_field = fuzzy_match_field(text_upper, threshold)
-    return matched_field is not None
-
-def extract_value(line, context_field=None):
-    """Extract value after ':' and filter out field names"""
-    if ':' not in line:
-        return ''
-    
-    parts = line.split(':', 1)
-    key_part = parts[0].strip()
-    value = parts[1].strip()
-    
-    # Remove any leading colon
-    if value.startswith(':'):
-        value = value[1:].strip()
-    
-    # CRITICAL: If value is empty or just symbols, return empty
-    if not value or value in [':', '-', '']:
-        return ''
-    
-    # UNIVERSAL FIX: If the value looks like a field name, reject it
-    if is_field_name(value):
-        return ''  # Not a valid value - it's a field name
-    
-    # Additional check: if value contains the key itself
-    if context_field:
-        field_words = context_field.upper().split()
-        value_upper = value.upper()
+        # Try fuzzy matching as fallback
+        best_match = None
+        best_score = 0
         
-        # If value is just the key words (common OCR error)
-        for word in field_words:
-            if word == value_upper:
-                return ''
+        for correct_value in CONTROLLED_VALUES[field].keys():
+            score = fuzz.ratio(value_upper, correct_value.upper())
+            if score > best_score and score > 80:
+                best_score = score
+                best_match = correct_value
+        
+        if best_match:
+            return best_match
     
     return value
 
-def is_date(text):
-    # Simple date check (DD/MM/YYYY)
-    return bool(DATE_PATTERN.match(text))
-
-def is_value_line(line):
-    return bool(line.strip())
-
-def extract_birth_date(tempat_tgl_lahir):
-    """Extract birth date from Tempat_Tgl_Lahir field"""
-    if not tempat_tgl_lahir:
-        return None
-    dates = DATE_PATTERN.findall(str(tempat_tgl_lahir))
-    return dates[0] if dates else None
-
-def normalize_key(key):
-    key = key.strip().replace("/", "_").replace(" ", "_").upper()
-    # Consistent key mapping
-    KEY_MAP = {
-        "PROVINSI" :"PROVINSI",
-        "KOTA" : "KOTA",
-        "KABUPATEN" : "KABUPATEN",
-        "NIK": "NIK",
-        "NAMA": "Nama", 
-        "TEMPAT_TGL_LAHIR": "Tempat_Tgl_Lahir",
-        "JENIS_KELAMIN": "Jenis_Kelamin",
-        "GOL_DARAH": "Gol_Darah", 
-        "ALAMAT": "Alamat",
-        "RT_RW": "RT_RW",
-        "KEL_DESA": "Kel_Desa", 
-        "KECAMATAN": "Kecamatan",
-        "AGAMA": "Agama",
-        "STATUS_PERKAWINAN": "Status_Perkawinan",
-        "PEKERJAAN": "Pekerjaan",
-        "KEWARGANEGARAAN": "Kewarganegaraan",
-        "BERLAKU_HINGGA": "Berlaku_Hingga"
+def extract_nik_smart(lines):
+    """Smart NIK extraction with OCR correction"""
+    # Define replacements at the top of the function
+    replacements = {
+        'O': '0', 'I': '1', 'L': '1', 'S': '5',
+        'U': '0', 'Z': '2', 'B': '8', 'G': '6',
+        'H': '', 'E': '', 'D': '0', 'T': '7',
+        ' ': '', ':': '', '-': '', '/': ''
     }
-    return KEY_MAP.get(key, key)
+    
+    for i, line in enumerate(lines):
+        line_upper = line.upper()
+        
+        # Look for NIK field
+        if "NIK" in line_upper:
+            # Try to extract from current line
+            value = extract_field_value(line, "NIK")
+            if value:
+                # Clean NIK value - replace common OCR errors
+                value = value.upper()
+                
+                for wrong, correct in replacements.items():
+                    value = value.replace(wrong, correct)
+                
+                # Extract only digits
+                digits = re.findall(r'\d', value)
+                if len(digits) >= 16:
+                    return ''.join(digits)[:16]
+            
+            # Check next line
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                # Clean next line similarly
+                next_line_clean = next_line.upper()
+                for wrong, correct in replacements.items():
+                    next_line_clean = next_line_clean.replace(wrong, correct)
+                
+                digits = re.findall(r'\d', next_line_clean)
+                if len(digits) >= 16:
+                    return ''.join(digits)[:16]
+    
+    # Fallback: search for 16-digit pattern in any line
+    for line in lines:
+        # Clean the line
+        clean_line = line.upper()
+        for wrong, correct in replacements.items():
+            clean_line = clean_line.replace(wrong, correct)
+        
+        # Look for 16 consecutive digits
+        digits = re.findall(r'\d', clean_line)
+        if len(digits) >= 16:
+            return ''.join(digits)[:16]
+    
+    return ""
 
-def parse_ktp_fields(text_lines):
-    """
-    Improved KTP field parsing with better field tracking and date assignment
-    """
-    ktp_data = {}
-    lines = [clean_text(l) for l in text_lines if l.strip()]
+def clean_nik_value(value):
+    """Clean NIK value by fixing OCR errors"""
+    if not value:
+        return ""
     
-    # Track processed fields
-    processed_fields = set()
-    # Store all dates found in the document
-    all_dates_in_doc = []
+    # Convert to uppercase
+    value = value.upper()
     
-    # Convert all lines to uppercase for easier matching
-    upper_lines = [line.upper() for line in lines]
+    # Common OCR replacements for NIK - define it here
+    replacements = {
+        'O': '0', 'I': '1', 'L': '1', 'S': '5',
+        'U': '0', 'Z': '2', 'B': '8', 'G': '6',
+        'H': '', 'E': '', 'D': '0', 'T': '7',
+        'A': '4', ' ': '', ':': '', '-': '',
+        '/': '', '\\': '', '|': ''
+    }
+    
+    for wrong, correct in replacements.items():
+        value = value.replace(wrong, correct)
+    
+    # Extract only digits
+    digits = re.findall(r'\d', value)
+    
+    if len(digits) >= 16:
+        return ''.join(digits)[:16]
+    elif len(digits) > 0:
+        # Return what we have if less than 16
+        return ''.join(digits)
+    
+    return value
+
+def parse_ktp_fields(raw_text):
+    """
+    Optimized KTP parser with better field detection and consistency
+    """
+    if not raw_text:
+        return {field: "" for field in FIELD_MAPPING.values()}
+    
+    # Clean and prepare lines
+    lines = [line.strip() for line in raw_text if line.strip()]
+    result = {field: "" for field in FIELD_MAPPING.values()}
+    
+    # Extract NIK first 
+    nik_raw = extract_nik_smart(lines)
+    result["NIK"] = clean_nik_value(nik_raw)
+    
+    # Find all dates in the document
+    all_dates = []
+    for line in lines:
+        dates = DATE_PATTERN.findall(line)
+        all_dates.extend(dates)
+    
+    # Remove duplicates while preserving order
+    unique_dates = []
+    for date in all_dates:
+        if date not in unique_dates:
+            unique_dates.append(date)
     
     i = 0
     while i < len(lines):
         line = lines[i]
-        if not line.strip():
-            i += 1
-            continue
-            
-        # Extract dates from current line for later use
-        dates_in_line = DATE_PATTERN.findall(line)
-        all_dates_in_doc.extend(dates_in_line)
+        line_upper = line.upper()
         
-        upper_line = line.upper()
+        # === PROVINSI ===
+        if not result["Provinsi"] and "PROVINSI" in line_upper:
+            value = extract_field_value(line, "PROVINSI")
+            if value:
+                result["Provinsi"] = value
         
-        # === NIK ===
-        if "NIK" not in processed_fields and "NIK" in upper_line:
-            val = None
-            # Check current line for NIK value
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            elif i + 1 < len(lines):
-                # Check next line
-                next_line = lines[i + 1]
-                if next_line and next_line.strip():
-                    # Check if next line contains digits (likely NIK)
-                    if re.search(r'\d{16}', next_line):
-                        val = next_line.strip()
-                        i += 1
-            
-            if not val:
-                # Extract from current line pattern
-                nik_match = re.search(r'(\d{16})', line)
-                if nik_match:
-                    val = nik_match.group(1)
-            
-            if val:
-                ktp_data["NIK"] = val
-                processed_fields.add("NIK")
-                i += 1
-                continue
-        
+        # === KOTA / KABUPATEN ===
+        elif not result["Kota_Kabupaten"] and (
+            "KOTA" in line_upper or "KABUPATEN" in line_upper or "KAB " in line_upper or "KAB." in line_upper
+        ):
+            # Try extracting after the field label
+            value = extract_field_value(line, "KOTA")  # Will match "KOTA"
+            if not value:
+                value = extract_field_value(line, "KABUPATEN")
+            if not value:
+                value = extract_field_value(line, "KAB")  # fallback for "KAB."
+
+            if value:
+                result["Kota_Kabupaten"] = value.strip()
+            else:
+                # Often the actual name is on the next line
+                if i + 1 < len(lines):
+                    result["Kota_Kabupaten"] = lines[i + 1].strip()
+                    i += 1
+
         # === NAMA ===
-        elif "NAMA" not in processed_fields and "NAMA" in upper_line:
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            # If no value after colon, check next lines for name
-            if not val or val in [":", ""]:
-                name_parts = []
-                j = i + 1
-                # Collect name parts until we hit another field
-                while j < len(lines) and j - i < 5:  # Limit to 5 lines
-                    next_line_upper = lines[j].upper()
-                    # Stop if we encounter another field indicator
-                    if (any(field in next_line_upper for field in ["TEMPAT", "TGL", "LAHIR", "JENIS", "KELAMIN"]) or
-                        DATE_PATTERN.search(lines[j])):
-                        break
-                    name_parts.append(lines[j].strip())
-                    j += 1
-                
-                if name_parts:
-                    val = " ".join(name_parts).strip()
-                    i = j - 1
-            
-            if val and val not in ["NAMA", ":", ""]:
-                ktp_data["Nama"] = val
-                processed_fields.add("NAMA")
-                i += 1
-                continue
-        
+        elif not result["Nama"] and "NAMA" in line_upper.replace(" ", ""):
+            # Try same-line extraction first
+            value = extract_field_value(line, "NAMA")
+
+            if value and value not in ["NAMA", ":", "", ".", "-"]:
+                # Clean same-line value
+                cleaned = re.sub(r'^[:\.\-\s]+', '', value).strip()
+                if cleaned:
+                    result["Nama"] = cleaned
+            else:
+                # Fallback: Read from next line
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+
+                    # Reject if next line is another field
+                    if not any(
+                        key in nxt.upper().replace(" ", "")
+                        for key in FIELD_PATTERNS):
+                        result["Nama"] = nxt
+                        i += 1  # consume next line
+
         # === TEMPAT/TGL LAHIR ===
-        elif "TEMPAT_TGL_LAHIR" not in processed_fields and any(keyword in upper_line for keyword in ["TEMPAT", "TGL", "LAHIR"]):
-            # Try to find the birth info pattern
-            j = i
+        elif not result["Tempat_Tgl_Lahir"] and any(
+            keyword in line_upper for keyword in ["TEMPAT", "TGL", "LAHIR"]
+        ):
             birth_info = []
-            found_date = False
-            
-            while j < len(lines) and j - i < 4:  # Look ahead 4 lines max
-                current = lines[j]
-                current_upper = current.upper()
-                
-                # Stop if we hit the next major field
-                if j > i and any(field in current_upper for field in ["JENIS", "KELAMIN", "GOL", "DARAH", "ALAMAT"]):
+            j = i
+
+            while j < len(lines) and j - i < 3:
+                current_line = lines[j].strip()
+                upper_current = current_line.upper().replace(" ", "")
+
+                # === STOP IF THIS LINE IS ANOTHER FIELD ===
+                if any(key in upper_current for key in FIELD_PATTERNS) and j != i:
                     break
-                
-                birth_info.append(current.strip())
-                
-                # Check if we found a date in this line
-                if DATE_PATTERN.search(current):
-                    found_date = True
-                
+
+                birth_info.append(current_line)
+
+                # === STOP EARLY IF DATE FOUND ===
+                if DATE_PATTERN.search(current_line):
+                    break
+
                 j += 1
             
             if birth_info:
-                # Join birth info and clean it up
+                # Join and clean birth info
                 birth_text = " ".join(birth_info)
-                # Remove "Tempat/Tgl Lahir" or similar prefixes
-                birth_text = re.sub(r'^.*?(TEMPAT|TGL|LAHIR)[:\s]*', '', birth_text, flags=re.IGNORECASE).strip()
-                
-                if birth_text:
-                    ktp_data["Tempat_Tgl_Lahir"] = birth_text
-                    processed_fields.add("TEMPAT_TGL_LAHIR")
-                    i = j - 1
-                    i += 1
-                    continue
-        
+                # Extract just the birth location and date
+                birth_text = re.sub(r'.*?(TEMPAT\s*[/|]?\s*T?GL?\s*LAHIR\s*[\.:]?\s*)', '', 
+                                  birth_text, flags=re.IGNORECASE)
+                result["Tempat_Tgl_Lahir"] = fix_tempat_tgl_lahir(birth_text)
+                i = j - 1
+
         # === JENIS KELAMIN ===
-        elif "JENIS_KELAMIN" not in processed_fields and ("JENIS" in upper_line or "KELAMIN" in upper_line):
-            val = None
-            # Try to find the gender value
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            # Look for gender in current or next line
-            if not val or val in ["JENIS", "KELAMIN", ":", ""]:
-                # Check current line for gender keywords
-                if "LAKI" in upper_line or "PEREMPUAN" in upper_line:
-                    val = line
-                elif i + 1 < len(lines):
-                    next_line_upper = lines[i + 1].upper()
-                    if "LAKI" in next_line_upper or "PEREMPUAN" in next_line_upper:
-                        val = lines[i + 1].strip()
-                        i += 1
-            
-            if val:
-                # Clean the value - remove field names
-                val_clean = re.sub(r'.*(JENIS|KELAMIN)[:\s]*', '', val, flags=re.IGNORECASE).strip()
-                if val_clean:
-                    # Apply fuzzy matching for controlled value
-                    matched_val = fuzzy_match_value("JENIS KELAMIN", val_clean)
-                    ktp_data["Jenis_Kelamin"] = matched_val if matched_val else val_clean
-                    processed_fields.add("JENIS_KELAMIN")
+        elif not result["Jenis_Kelamin"] and any(
+            keyword in line_upper for keyword in ["JENIS", "KELAMIN"]
+        ):
+            value = extract_field_value(line, "JENIS_KELAMIN")
+            if value:
+                result["Jenis_Kelamin"] = normalize_controlled_value("Jenis_Kelamin", value)
+            elif i + 1 < len(lines):
+                next_line = lines[i + 1].upper()
+                if "LAKI" in next_line or "PEREMPUAN" in next_line:
+                    result["Jenis_Kelamin"] = normalize_controlled_value("Jenis_Kelamin", lines[i + 1])
                     i += 1
-                    continue
         
         # === GOLONGAN DARAH ===
-        elif "GOL_DARAH" not in processed_fields and ("GOL" in upper_line or "DARAH" in upper_line):
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in ["GOL", "DARAH", ":", ""]:
-                # Check current and next line for blood type
-                if any(bt in upper_line for bt in ["A", "B", "AB", "O"]):
-                    val = line
-                elif i + 1 < len(lines):
-                    next_line = lines[i + 1]
-                    if any(bt in next_line.upper() for bt in ["A", "B", "AB", "O"]):
-                        val = next_line.strip()
-                        i += 1
-            
-            if val:
-                # Parse blood type
-                blood_type = parse_blood_type_comprehensive(val)
-                if blood_type:
-                    ktp_data["Gol_Darah"] = blood_type
-                    processed_fields.add("GOL_DARAH")
-                    i += 1
-                    continue
+        elif not result["Gol_Darah"] and any(
+            keyword in line_upper for keyword in ["GOL", "DARAH"]
+        ):
+            value = extract_field_value(line, "GOL_DARAH")
+            if value:
+                # Extract blood type
+                blood_match = BLOOD_TYPE_PATTERN.search(value)
+                if blood_match:
+                    result["Gol_Darah"] = blood_match.group(1).upper()
         
         # === ALAMAT ===
-        elif "ALAMAT" not in processed_fields and "ALAMAT" in upper_line:
-            addr_parts = []
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-                if val and val not in [":", ""]:
-                    addr_parts.append(val)
-            
-            # Collect address lines until next field
-            j = i + 1
-            while j < len(lines) and j - i < 10:  # Limit address to 10 lines
-                next_line = lines[j]
-                next_upper = next_line.upper()
+        elif not result["Alamat"] and "ALAMAT" in line_upper:
+            value = extract_field_value(line, "ALAMAT")
+            if value:
+                result["Alamat"] = value
+            else:
+                # Collect multi-line address
+                addr_parts = []
+                j = i + 1
+                while j < len(lines) and j - i < 5:  # Limit to 5 lines
+                    next_line_upper = lines[j].upper()
+                    # Stop at next field
+                    if any(pattern.search(next_line_upper) for pattern in [
+                        FIELD_PATTERNS["RT_RW"], FIELD_PATTERNS["KEL_DESA"]
+                    ]):
+                        break
+                    addr_parts.append(lines[j])
+                    j += 1
                 
-                # Stop conditions for address
-                stop_conditions = [
-                    "RT/RW" in next_upper, "RTRW" in next_upper,
-                    "KEL/DESA" in next_upper, "KEL" in next_upper and "DESA" in next_upper,
-                    "KECAMATAN" in next_upper, "KEC" in next_upper,
-                    "AGAMA" in next_upper, "STATUS" in next_upper,
-                    "PEKERJAAN" in next_upper
-                ]
-                
-                if any(stop_conditions):
-                    break
-                
-                addr_parts.append(next_line.strip())
-                j += 1
-            
-            if addr_parts:
-                ktp_data["Alamat"] = " ".join(addr_parts).strip()
-                processed_fields.add("ALAMAT")
-                i = j - 1
-                i += 1
-                continue
+                if addr_parts:
+                    result["Alamat"] = " ".join(addr_parts).strip()
+                    i = j - 1
         
         # === RT/RW ===
-        elif "RT_RW" not in processed_fields and (
-            re.search(r"[RA]T\s*/\s*[RWA]W", upper_line) or 
-            re.search(r"R?T\s*R?W", upper_line)
-        ):
-            val = None
-
-            # value after colon on same line
-            if ":" in line:
-                val = line.split(":", 1)[1].strip()
-
-            # if this line has no number, use next line
-            if not val or not re.search(r"\d{2,3}\s*/\s*\d{2,3}", val):
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1]
-                    if re.search(r"\d{2,3}\s*/\s*\d{2,3}", next_line):
-                        val = next_line.strip()
-                        i += 1
-
-            # save cleaned RT/RW
-            if val:
-                ktp_data["Rt_Rw"] = re.sub(r"[^0-9/]", "", val)
-            else:
-                ktp_data["Rt_Rw"] = ""
-
-            processed_fields.add("RT_RW")
-            i += 1
-            continue
-
+        elif not result["Rt_Rw"] and FIELD_PATTERNS["RT_RW"].search(line_upper):
+            value = extract_field_value(line, "RT_RW")
+            if value:
+                # Extract RT/RW numbers
+                rt_rw_match = RT_RW_PATTERN.search(value)
+                if rt_rw_match:
+                    result["Rt_Rw"] = f"{rt_rw_match.group(1)}/{rt_rw_match.group(2)}"
+            elif i + 1 < len(lines):
+                next_line = lines[i + 1]
+                rt_rw_match = RT_RW_PATTERN.search(next_line)
+                if rt_rw_match:
+                    result["Rt_Rw"] = f"{rt_rw_match.group(1)}/{rt_rw_match.group(2)}"
+                    i += 1
         
         # === KEL/DESA ===
-        elif "KEL_DESA" not in processed_fields and ("KEL" in upper_line or "DESA" in upper_line):
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in ["KEL", "DESA", ":", ""]:
-                if i + 1 < len(lines) and not fuzzy_match_field(lines[i + 1].upper()):
-                    val = lines[i + 1].strip()
+        elif not result["Kel_Desa"] and FIELD_PATTERNS["KEL_DESA"].search(line_upper):
+            value = extract_field_value(line, "KEL_DESA")
+            if value:
+                result["Kel_Desa"] = value
+            elif i + 1 < len(lines):
+                next_line = lines[i + 1]
+                if not any(pattern.search(next_line.upper()) for pattern in [
+                    FIELD_PATTERNS["KECAMATAN"], FIELD_PATTERNS["AGAMA"]
+                ]):
+                    result["Kel_Desa"] = next_line.strip()
                     i += 1
-            
-            if val and val not in ["KEL", "DESA", ":", ""]:
-                ktp_data["Kel_Desa"] = val
-                processed_fields.add("KEL_DESA")
-                i += 1
-                continue
         
+        # === KECAMATAN ===
+        elif not result["Kecamatan"] and any(
+            fuzz.ratio(k, line_upper) >= 70
+            for k in ["KECAMATAN", "KECMATAN", "KCAMATAN", "KECAMATAM"]
+        ):
+            # remove corrupted label
+            text = re.sub(r'KEC[A-Z]*[^A-Z0-9]*', '', line_upper).strip()
+
+            # if empty, maybe next line is value
+            if not text and i+1 < len(lines):
+                nxt = lines[i+1].strip()
+                # stop if next line is a new field
+                if not any(p.search(nxt.upper()) for p in [
+                    FIELD_PATTERNS["AGAMA"], FIELD_PATTERNS["PEKERJAAN"], FIELD_PATTERNS["KEL_DESA"]
+                ]):
+                    text = nxt
+
+            result["Kecamatan"] = text.title().strip()
+
         # === AGAMA ===
-        elif "AGAMA" not in processed_fields and "AGAMA" in upper_line:
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in ["AGAMA", ":", ""]:
-                # Check if the value is on the same line after "AGAMA"
-                # e.g., "Agama KAISTEN"
-                parts = line.split(maxsplit=1)
-                if len(parts) > 1 and parts[0].upper() == "AGAMA":
-                    val = parts[1].strip()
-                elif i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    # Don't skip if next line looks like a value (not a field)
-                    if not fuzzy_match_field(next_line):
-                        val = next_line
-                        i += 1
-            
-            if val:
-                # Apply fuzzy matching for religion
-                matched_val = fuzzy_match_value("AGAMA", val)
-                ktp_data["Agama"] = matched_val if matched_val else val
-                processed_fields.add("AGAMA")
-                i += 1
-                continue
-            
-            if val:
-                # Apply fuzzy matching for religion
-                matched_val = fuzzy_match_value("AGAMA", val)
-                ktp_data["Agama"] = matched_val if matched_val else val
-                processed_fields.add("AGAMA")
-                i += 1
-                continue
-        
+        elif not result["Agama"] and "AGAMA" in line_upper:
+            value = extract_field_value(line, "AGAMA")
+            if value:
+                result["Agama"] = normalize_controlled_value("Agama", value)
+            elif i+1 < len(lines):
+                nxt = lines[i+1].strip()
+                # stop if next line is a new field
+                if not any(pattern.search(nxt.upper()) for pattern in FIELD_PATTERNS.values()):
+                    value = nxt
+                    result["Agama"] = normalize_controlled_value("Agama", value)
+
         # === PEKERJAAN ===
-        elif "PEKERJAAN" not in processed_fields and "PEKERJAAN" in upper_line:
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in ["PEKERJAAN", ":", ""]:
-                if i + 1 < len(lines) and not fuzzy_match_field(lines[i + 1].upper()):
-                    val = lines[i + 1].strip()
-                    i += 1
-            
-            if val and val not in ["PEKERJAAN", ":", ""]:
-                ktp_data["Pekerjaan"] = val
-                processed_fields.add("PEKERJAAN")
-                i += 1
-                continue
+        elif not result["Pekerjaan"] and "PEKERJAAN" in line_upper:
+            value = extract_field_value(line, "PEKERJAAN")
+            if value:
+                result["Pekerjaan"] = value
+            # stop if next line is a new field
+                if not any(p.search(nxt.upper()) for p in FIELD_PATTERNS):
+                    value = nxt
+                result["Pekerjaan"] = normalize_controlled_value("Pekerjaan", value)
+            else:
+                # Fallback: Read from next line
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+
+                    # Reject if next line is another field
+                    if not any(
+                        key in nxt.upper().replace(" ", "")
+                        for key in FIELD_PATTERNS):
+                        result["Pekerjaan"] = nxt
+                        i += 1  # consume next line
         
         # === KEWARGANEGARAAN ===
-        elif "KEWARGANEGARAAN" not in processed_fields and ("KEWARGANEGARAAN" in upper_line or "WNI" in upper_line or "WNA" in upper_line):
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            
-            if not val or val in ["KEWARGANEGARAAN", ":", ""]:
-                # Check current line for WNI/WNA
-                if "WNI" in upper_line:
-                    val = "WNI"
-                elif "WNA" in upper_line:
-                    val = "WNA"
-                elif i + 1 < len(lines):
-                    next_line_upper = lines[i + 1].upper()
-                    if "WNI" in next_line_upper:
-                        val = "WNI"
-                        i += 1
-                    elif "WNA" in next_line_upper:
-                        val = "WNA"
-                        i += 1
-            
-            if val and val not in ["KEWARGANEGARAAN", ":", ""]:
-                ktp_data["Kewarganegaraan"] = val
-                processed_fields.add("KEWARGANEGARAAN")
-                i += 1
-                continue
+        elif not result["Kewarganegaraan"] and any(
+            keyword in line_upper for keyword in ["KEWARGANEGARAAN", "WNI", "WNA"]
+        ):
+            value = extract_field_value(line, "KEWARGANEGARAAN")
+            if value:
+                result["Kewarganegaraan"] = normalize_controlled_value("Kewarganegaraan", value)
         
-        # === PROVINSI ===
-        elif "PROVINSI" not in processed_fields and "PROVINSI" in upper_line:
-            val = None
-            if ':' in line:
-                val = line.split(':', 1)[1].strip()
-            else:
-                # Remove "PROVINSI" prefix
-                val = re.sub(r'^PROVINSI\s*', '', line, flags=re.IGNORECASE).strip()
-            
-            if not val and i + 1 < len(lines):
+        # === BERLAKU HINGGA ===
+        elif not result["Berlaku_Hingga"] and "BERLAKU HINGGA" in line_upper:
+            value = extract_field_value(line, "BERLAKU_HINGGA")
+            if value:
+                result["Berlaku_Hingga"] = value
+            elif i + 1 < len(lines):
                 next_line = lines[i + 1]
-                if not fuzzy_match_field(next_line.upper()):
-                    val = next_line.strip()
+                if DATE_PATTERN.search(next_line) or "SEUMUR" in next_line.upper():
+                    result["Berlaku_Hingga"] = next_line.strip()
                     i += 1
-            
-            if val:
-                ktp_data["Provinsi"] = val
-                processed_fields.add("PROVINSI")
-                i += 1
-                continue
         
         i += 1
     
-    # === SMART DATE PROCESSING ===
-    # Remove duplicates while preserving order
-    unique_dates = []
-    for date in all_dates_in_doc:
-        if date not in unique_dates:
-            unique_dates.append(date)
+    # === SMART DATE ASSIGNMENT ===
+    # Check for SEUMUR HIDUP
+    has_seumur_hidup = any("SEUMUR" in line.upper() and "HIDUP" in line.upper() 
+                          for line in lines)
     
-    # Extract birth date if available
+    if has_seumur_hidup:
+        result["Berlaku_Hingga"] = "SEUMUR HIDUP"
+    
+    # Extract birth date for filtering
     birth_date = None
-    if "Tempat_Tgl_Lahir" in ktp_data:
-        birth_dates = DATE_PATTERN.findall(ktp_data["Tempat_Tgl_Lahir"])
+    if result["Tempat_Tgl_Lahir"]:
+        birth_dates = DATE_PATTERN.findall(result["Tempat_Tgl_Lahir"])
         if birth_dates:
             birth_date = birth_dates[0]
     
-    # Filter out birth date
+    # Filter out birth date from unique dates
     other_dates = [date for date in unique_dates if date != birth_date]
     
-    # Check for SEUMUR HIDUP
-    has_seumur_hidup = False
-    for line in text_lines:
-        line_upper = line.upper()
-        if "SEUMUR" in line_upper and "HIDUP" in line_upper:
-            has_seumur_hidup = True
-            break
-    
-    # Assign dates smartly
-    if has_seumur_hidup:
-        ktp_data["Berlaku_Hingga"] = "SEUMUR HIDUP"
-    
+    # Assign dates
     if other_dates:
         if len(other_dates) >= 2:
-            # Usually first non-birth date is issue date, second is expiry
-            ktp_data["Tanggal_Terbit"] = other_dates[0]
+            # Usually: issue date, expiry date
+            result["Tanggal_Terbit"] = other_dates[0]
             if not has_seumur_hidup:
-                ktp_data["Berlaku_Hingga"] = other_dates[1]
+                result["Berlaku_Hingga"] = other_dates[1]
         elif len(other_dates) == 1:
-            # Single date - likely issue date
-            ktp_data["Tanggal_Terbit"] = other_dates[0]
+            result["Tanggal_Terbit"] = other_dates[0]
     
-    # Ensure all required fields exist
-    required_fields = ["NIK", "Nama", "Tempat_Tgl_Lahir", "Jenis_Kelamin", 
-                      "Alamat", "RT_RW", "Kel_Desa", "Agama", "Pekerjaan",
-                      "Kewarganegaraan", "Tanggal_Terbit", "Berlaku_Hingga"]
-    
-    for field in required_fields:
-        if field not in ktp_data:
-            ktp_data[field] = ""
-    
-    return ktp_data
+    return result
+
+
+
 
 # OCR Worker Management
 _worker_process = None
@@ -1303,13 +748,32 @@ def start_worker_process():
         return False
 
 def get_worker_process():
-    """Get or create worker process"""
+    """Get or create worker process with proper initialization"""
     global _worker_process
     
     with _worker_lock:
         if _worker_process is None or _worker_process.poll() is not None:
-            if not start_worker_process():
-                raise RuntimeError("Failed to start OCR worker")
+            cleanup_worker()  # Clean up first
+            
+            logger.info("Starting OCR worker process...")
+            worker_script = os.path.join(BASE_DIR, "workers.py")
+            
+            _worker_process = subprocess.Popen(
+                [sys.executable, worker_script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Simple initialization check
+            time.sleep(2)  # Reduced from 5 seconds
+            if _worker_process.poll() is not None:
+                raise RuntimeError("Worker process failed to start")
+            
+            logger.info("Worker process started")
         
         return _worker_process
 
@@ -1332,8 +796,6 @@ def safe_ocr_internal(image_path):
             line = process.stdout.readline()
             if line:
                 response = json.loads(line.strip())
-                # ✅ UPDATE: Handle new line-based response format
-                # The response now contains "raw_text" as lines, not individual words
                 if "raw_text" in response:
                     return response
         else:
@@ -1379,101 +841,67 @@ def preprocess_img_to_tempfile(img_path, long_side=1024):
         raise
 
 @timeout(60)  # Overall timeout for processing
-def enhanced_ktp_processing(image_path: str):
-    """Main KTP processing function with timeout"""
+def enhanced_ktp_processing(image_path: str) -> Tuple[List[str], Dict[str, str], str]:
+    """Simplified KTP processing function"""
     try:
-        # Validate input
-        if not os.path.exists(image_path):
-            return [], {}, json.dumps({
-                "raw_text": [],
-                "extracted_data": {},
-                "confidence_info": {"error": f"Image file not found: {image_path}"}
-            })
+        # Simple preprocessing
+        temp_image_path = preprocess_img_to_tempfile(image_path, long_side=1024)
         
-        # Get OCR results
-        try:
-            # Preprocess image
-            temp_image_path = preprocess_img_to_tempfile(image_path, long_side=1024)
-            worker_output = safe_ocr(temp_image_path, timeout=30)
-            
-            # Clean up temp file
-            if os.path.exists(temp_image_path):
-                os.unlink(temp_image_path)
-                
-        except TimeoutException as e:
-            logger.error(f"OCR timeout: {e}")
-            return [], {}, json.dumps({
-                "raw_text": [],
-                "extracted_data": {},
-                "confidence_info": {"error": f"OCR timeout: {str(e)}"}
-            })
-        except Exception as e:
-            logger.error(f"OCR failed: {e}")
-            return [], {}, json.dumps({
-                "raw_text": [],
-                "extracted_data": {},
-                "confidence_info": {"error": f"OCR failed: {str(e)}"}
-            })
+        # OCR with timeout
+        worker_output = safe_ocr(temp_image_path, timeout=20)  # Reduced timeout
+        
+        # Clean up temp file
+        if os.path.exists(temp_image_path):
+            os.unlink(temp_image_path)
         
         text_lines = worker_output.get("raw_text", [])
         
-        # Log the received lines for debugging
-        logger.info(f"OCR returned {len(text_lines)} lines")
-        for i, line in enumerate(text_lines):
-            logger.info(f"Line {i+1}: {line}")
+        # Parse fields
+        parsed_data = parse_ktp_fields(text_lines)
         
-        confidence_info = {
-            "mean_confidence": worker_output.get("mean_confidence", 0),
-            "line_count": len(text_lines)
+        # Prepare output
+        output_data = {
+            "raw_text": text_lines,
+            "extracted_data": parsed_data,
+            "confidence_info": worker_output.get("confidence_info", {})
         }
         
-        if worker_output.get("error"):
-            confidence_info["error"] = worker_output["error"]
+        return text_lines, parsed_data, json.dumps(output_data, ensure_ascii=False)
         
-        # Parse KTP fields
-        ktp_data = {}
-        if text_lines:
-            try:
-                ktp_data = parse_ktp_fields(text_lines)
-            except Exception as e:
-                logger.error(f"Parsing failed: {e}")
-                ktp_data = {}
-        
-        # Normalize data
-        normalized_data = {}
-        for key, val in ktp_data.items():
-            clean_key = key.strip().replace(" ", "_").replace("/", "_").title()
-            if clean_key in normalized_data:
-                continue
-            if isinstance(val, str):
-                val = val.strip()
-            normalized_val = fuzzy_match_value(clean_key.upper(), val)
-            normalized_data[clean_key] = normalized_val
-        
-        # Build output WITHOUT formatted_text
-        output_json = json.dumps({
-            "raw_text": text_lines,  # Original lines without line numbers
-            "extracted_data": normalized_data,
-            "confidence_info": confidence_info
-        }, indent=2, ensure_ascii=False)
-        
-        # Return 3 values: text_lines, normalized_data, output_json
-        return text_lines, normalized_data, output_json
-        
-    except TimeoutException as e:
-        logger.error(f"KTP processing timeout: {e}")
-        return [], {}, json.dumps({
-            "raw_text": [],
-            "extracted_data": {},
-            "confidence_info": {"error": f"Processing timeout: {str(e)}"}
-        })
     except Exception as e:
-        logger.error(f"KTP processing failed: {e}")
+        logger.error(f"Processing failed: {e}")
         return [], {}, json.dumps({
             "raw_text": [],
             "extracted_data": {},
-            "confidence_info": {"error": f"Processing failed: {str(e)}"}
-        })
+            "confidence_info": {"error": str(e)}
+        }, ensure_ascii=False)
+
+def get_current_memory_mb(process=None):
+    """Get current memory usage in MB"""
+    try:
+        if process is None:
+            process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024
+    except Exception:
+        return 0
+
+#Simple memory tracking decorator
+def track_memory_usage(func):
+    """Decorator to track memory usage of a function"""
+    def wrapper(*args, **kwargs):
+        process = psutil.Process()
+        start_memory = process.memory_info().rss / 1024 / 1024
+        start_time = time.time()
+        
+        result = func(*args, **kwargs)
+        
+        end_time = time.time()
+        end_memory = process.memory_info().rss / 1024 / 1024
+        
+        logger.debug(f"{func.__name__} - Time: {(end_time-start_time)*1000:.1f}ms, Memory: {end_memory-start_memory:.1f}MB")
+        
+        return result
+    return wrapper
 
 # Global cleanup
 import atexit
